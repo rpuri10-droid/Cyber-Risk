@@ -1,463 +1,584 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Papa from 'papaparse';
+import {
+  ATTACK_PROFILES,
+  EMPTY_FILTERS,
+  activeFilterCount,
+  applyFilters,
+  computeMetrics,
+  datasetSpan,
+  formatBytes,
+  formatDay,
+  formatNumber,
+  formatPercent,
+  formatUsdCompact,
+  normalizeRow,
+  profileFor,
+  serviceName,
+} from './lib/analytics';
+import { BarList, Heatmap, HourStrip, ScoreGauge, TrendChart } from './components/Charts';
+import RiskQuantification from './components/RiskQuantification';
+import EventExplorer from './components/EventExplorer';
 
-const topPortsToShow = 6;
-const topAttackTypesToShow = 5;
+const DATA_URL = `${import.meta.env.BASE_URL}data/cybersecurity.csv`;
+const REQUIRED_COLUMNS = ['timestamp', 'src_ip', 'dst_ip', 'dst_port', 'protocol', 'label', 'attack_type'];
+const STORAGE_KEY = 'cyber-risk-assumptions-v1';
 
-function normalizeRow(row) {
-  return {
-    ...row,
-    label: Number(row.label),
-    bytes_sent: Number(row.bytes_sent || 0),
-    bytes_received: Number(row.bytes_received || 0),
-    src_port: Number(row.src_port || 0),
-    dst_port: Number(row.dst_port || 0),
-    is_internal_traffic: String(row.is_internal_traffic).toLowerCase() === 'true',
-  };
+const DEFAULT_ASSUMPTIONS = {
+  controlEffectiveness: 0.6,
+  lossPerEvent: Object.fromEntries(Object.entries(ATTACK_PROFILES).map(([type, p]) => [type, p.lossPerEvent])),
+};
+
+function loadAssumptions() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    if (saved && typeof saved.controlEffectiveness === 'number') {
+      return { ...DEFAULT_ASSUMPTIONS, ...saved, lossPerEvent: { ...DEFAULT_ASSUMPTIONS.lossPerEvent, ...saved.lossPerEvent } };
+    }
+  } catch {
+    // storage unavailable or corrupt: fall back to defaults
+  }
+  return DEFAULT_ASSUMPTIONS;
 }
 
-function groupBy(items, keySelector) {
-  return items.reduce((accumulator, item) => {
-    const key = keySelector(item) || 'unknown';
-    accumulator.set(key, (accumulator.get(key) || 0) + 1);
-    return accumulator;
-  }, new Map());
+function parseCsv(input) {
+  return new Promise((resolve, reject) => {
+    Papa.parse(input, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (result) => {
+        const fields = result.meta.fields || [];
+        const missing = REQUIRED_COLUMNS.filter((column) => !fields.includes(column));
+        if (missing.length) {
+          reject(new Error(`CSV is missing required column(s): ${missing.join(', ')}`));
+          return;
+        }
+        const rows = result.data.filter((row) => row.timestamp).map(normalizeRow);
+        if (rows.length === 0) {
+          reject(new Error('CSV contained no usable rows.'));
+          return;
+        }
+        resolve({ rows, skipped: result.errors.length });
+      },
+      error: (error) => reject(error),
+    });
+  });
 }
 
-function sortMapDescending(map) {
-  return [...map.entries()].sort((left, right) => right[1] - left[1]);
+function describeFilters(filters) {
+  const parts = [];
+  if (filters.from || filters.to) parts.push(`${filters.from ? formatDay(filters.from) : 'start'} – ${filters.to ? formatDay(filters.to) : 'end'}`);
+  if (filters.scope !== 'all') parts.push(`${filters.scope} traffic`);
+  if (filters.protocol !== 'all') parts.push(filters.protocol);
+  if (filters.attackType === 'attacks') parts.push('attacks only');
+  else if (filters.attackType === 'benign') parts.push('benign only');
+  else if (filters.attackType !== 'all') parts.push(profileFor(filters.attackType).label);
+  if (filters.port !== 'all') parts.push(`port ${serviceName(Number(filters.port))}`);
+  if (filters.agent !== 'all') parts.push(filters.agent);
+  if (filters.search.trim()) parts.push(`“${filters.search.trim()}”`);
+  return parts.length ? parts.join(' · ') : 'all traffic';
 }
 
-function formatNumber(value) {
-  return new Intl.NumberFormat('en-US').format(value);
+function buildFindings(metrics) {
+  const findings = [];
+  const top = metrics.byAle[0];
+  if (top) {
+    findings.push({
+      tone: 'high',
+      title: `${top.label} drives the most loss exposure`,
+      body: `${formatUsdCompact(top.inherentAle)} per year inherent (${formatPercent(top.inherentAle / (metrics.inherentAle || 1), 0)} of total), from ${top.count} observed attempts. Prioritize detections and controls for this family first.`,
+    });
+  }
+
+  const riskyPort = metrics.ports.filter((p) => p.total >= 50).sort((a, b) => b.rate - a.rate)[0];
+  if (riskyPort && riskyPort.attacks > 0) {
+    findings.push({
+      tone: 'moderate',
+      title: `${serviceName(riskyPort.key)} has the highest attack rate`,
+      body: `${formatPercent(riskyPort.rate)} of traffic to this port is malicious (${riskyPort.attacks} of ${formatNumber(riskyPort.total)} events) vs ${formatPercent(metrics.attackRate)} overall. Review exposure and access rules for this service.`,
+    });
+  }
+
+  const browserRate = (() => {
+    const browsers = metrics.agents.filter((a) => a.key.includes('browser'));
+    const total = browsers.reduce((s, a) => s + a.total, 0);
+    return total ? browsers.reduce((s, a) => s + a.attacks, 0) / total : 0;
+  })();
+  if (metrics.automated > 0 && metrics.automatedAttacks > 0) {
+    const lift = browserRate ? metrics.automatedAttackRate / browserRate : 0;
+    const scanner = metrics.agents.find((a) => a.key === 'sqlmap' || a.key === 'zgrab');
+    findings.push({
+      tone: 'moderate',
+      title: 'Automated clients are disproportionately hostile',
+      body: `${formatPercent(metrics.automatedAttackRate)} of curl / script / scanner traffic is malicious${lift ? ` — ${lift.toFixed(1)}× the browser rate` : ''}.${scanner ? ` Known attack tooling (${scanner.key}) appears in ${formatNumber(scanner.total)} events; consider blocking these user agents at the edge.` : ''}`,
+    });
+  }
+
+  if (metrics.momentum) {
+    const { change, recent, prior } = metrics.momentum;
+    findings.push({
+      tone: change > 0.15 ? 'high' : change < -0.15 ? 'low' : 'moderate',
+      title: `Attack rate ${change >= 0 ? 'rising' : 'falling'} over the last two weeks`,
+      body: `${formatPercent(recent.rate)} in the latest 14 days vs ${formatPercent(prior.rate)} in the 14 days before (${change >= 0 ? '+' : ''}${(change * 100).toFixed(0)}%).`,
+    });
+  }
+
+  const peak = [...metrics.hours].sort((a, b) => b.attacks - a.attacks)[0];
+  if (peak && peak.attacks > 0) {
+    findings.push({
+      tone: 'low',
+      title: `Peak attack hour: ${String(peak.hour).padStart(2, '0')}:00 UTC`,
+      body: `${peak.attacks} attacks fall in this hour. Make sure on-call coverage and alert routing match it.`,
+    });
+  }
+  return findings;
 }
 
-function formatBytes(value) {
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)} MB`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)} KB`;
-  return `${Math.round(value)} B`;
-}
-
-function formatPercent(value) {
-  return `${value.toFixed(1)}%`;
-}
-
-function App() {
-  const [rows, setRows] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  const [selectedMetric, setSelectedMetric] = useState(null);
+export default function App() {
+  const [allRows, setAllRows] = useState([]);
+  const [source, setSource] = useState('cybersecurity.csv');
+  const [status, setStatus] = useState({ loading: true, error: '', notice: '' });
+  const [filters, setFilters] = useState(EMPTY_FILTERS);
+  const [assumptions, setAssumptions] = useState(loadAssumptions);
+  const fileInput = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
-
-    async function loadData() {
-      try {
-        const response = await fetch('/data/cybersecurity.csv');
-        if (!response.ok) {
-          throw new Error(`Unable to load dataset: ${response.status}`);
-        }
-
-        const csvText = await response.text();
-        const parsed = Papa.parse(csvText, {
-          header: true,
-          skipEmptyLines: true,
-        });
-
-        if (parsed.errors.length > 0) {
-          throw new Error(parsed.errors[0].message);
-        }
-
-        const normalized = parsed.data.map(normalizeRow);
-
-        if (!cancelled) {
-          setRows(normalized);
-          setLoading(false);
-        }
-      } catch (loadError) {
-        if (!cancelled) {
-          setError(loadError.message || 'Failed to load dataset');
-          setLoading(false);
-        }
-      }
-    }
-
-    loadData();
-
+    fetch(DATA_URL)
+      .then((response) => {
+        if (!response.ok) throw new Error(`Unable to load dataset (HTTP ${response.status})`);
+        return response.text();
+      })
+      .then(parseCsv)
+      .then(({ rows, skipped }) => {
+        if (cancelled) return;
+        setAllRows(rows);
+        setStatus({ loading: false, error: '', notice: skipped ? `${skipped} malformed rows skipped.` : '' });
+      })
+      .catch((error) => {
+        if (!cancelled) setStatus({ loading: false, error: error.message || 'Failed to load dataset', notice: '' });
+      });
     return () => {
       cancelled = true;
     };
   }, []);
 
-  const metrics = useMemo(() => {
-    if (rows.length === 0) {
-      return null;
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(assumptions));
+    } catch {
+      // ignore storage failures
     }
+  }, [assumptions]);
 
-    const attacks = rows.filter((row) => row.label === 1);
-    const benign = rows.length - attacks.length;
-    const internalTraffic = rows.filter((row) => row.is_internal_traffic).length;
-    const totalBytesSent = rows.reduce((sum, row) => sum + row.bytes_sent, 0);
-    const totalBytesReceived = rows.reduce((sum, row) => sum + row.bytes_received, 0);
-    const attackTypes = sortMapDescending(groupBy(attacks, (row) => row.attack_type));
-    const protocols = sortMapDescending(groupBy(rows, (row) => row.protocol));
-    const ports = sortMapDescending(groupBy(rows, (row) => String(row.dst_port)));
-    const suspiciousTraffic = attacks
-      .slice()
-      .sort((left, right) => right.bytes_sent + right.bytes_received - (left.bytes_sent + left.bytes_received))
-      .slice(0, 8);
-    const attackRate = attacks.length / rows.length;
-    const internalRate = internalTraffic / rows.length;
-    const concentration = attackTypes.length > 0 ? attackTypes[0][1] / attacks.length : 0;
-    const threatPressure = Math.min(100, Math.round(attackRate * 700 + internalRate * 80 + concentration * 140));
+  const handleUpload = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setStatus((current) => ({ ...current, notice: `Loading ${file.name}…` }));
+    try {
+      const { rows, skipped } = await parseCsv(file);
+      setAllRows(rows);
+      setSource(file.name);
+      setFilters(EMPTY_FILTERS);
+      setStatus({ loading: false, error: '', notice: `Loaded ${formatNumber(rows.length)} events from ${file.name}.${skipped ? ` ${skipped} malformed rows skipped.` : ''}` });
+    } catch (error) {
+      setStatus((current) => ({ ...current, notice: `Could not load ${file.name}: ${error.message}` }));
+    }
+  };
 
-    const totalByDay = groupBy(rows, (row) => row.timestamp.slice(0, 10));
-    const attackByDay = groupBy(attacks, (row) => row.timestamp.slice(0, 10));
-    const days = [...new Set(rows.map((row) => row.timestamp.slice(0, 10)))].sort();
-    const trend = days.map((day) => ({
-      day,
-      total: totalByDay.get(day) || 0,
-      attacks: attackByDay.get(day) || 0,
-    }));
+  const fullSpan = useMemo(() => datasetSpan(allRows), [allRows]);
+  const rows = useMemo(() => applyFilters(allRows, filters), [allRows, filters]);
+  const metrics = useMemo(() => computeMetrics(rows, assumptions), [rows, assumptions]);
+  const findings = useMemo(() => buildFindings(metrics), [metrics]);
 
-    return {
-      totalEvents: rows.length,
-      attackEvents: attacks.length,
-      benignEvents: benign,
-      internalTraffic,
-      attackRate,
-      internalRate,
-      totalBytesSent,
-      totalBytesReceived,
-      threatPressure,
-      attackTypes,
-      protocols,
-      ports,
-      suspiciousTraffic,
-      trend,
-      topAttack: attackTypes[0]?.[0] || 'unknown',
-      topAttackCount: attackTypes[0]?.[1] || 0,
-    };
-  }, [rows]);
+  const options = useMemo(
+    () => ({
+      protocols: [...new Set(allRows.map((r) => r.protocol))].sort(),
+      attackTypes: [...new Set(allRows.filter((r) => r.label).map((r) => r.attack_type))].sort(),
+      ports: commonPorts(allRows),
+      agents: [...new Set(allRows.map((r) => r.agent))].sort(),
+    }),
+    [allRows],
+  );
 
-  const attackBars = useMemo(() => {
-    if (!metrics) return [];
-    const maxCount = Math.max(...metrics.attackTypes.map(([, count]) => count), 1);
-    return metrics.attackTypes.slice(0, topAttackTypesToShow).map(([name, count]) => ({
-      name,
-      count,
-      width: Math.max(10, (count / maxCount) * 100),
-    }));
-  }, [metrics]);
+  const setFilter = useCallback((key, value) => setFilters((current) => ({ ...current, [key]: value })), []);
+  const toggleFilter = useCallback(
+    (key, value) => setFilters((current) => ({ ...current, [key]: current[key] === value ? EMPTY_FILTERS[key] : value })),
+    [],
+  );
+  const focusExplorer = () => document.getElementById('explorer')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
-  const protocolBars = useMemo(() => {
-    if (!metrics) return [];
-    const maxCount = Math.max(...metrics.protocols.map(([, count]) => count), 1);
-    return metrics.protocols.map(([name, count]) => ({
-      name,
-      count,
-      width: Math.max(10, (count / maxCount) * 100),
-    }));
-  }, [metrics]);
-
-  if (loading) {
-    return <div className="app-shell loading-state">Loading dataset-driven dashboard...</div>;
+  if (status.loading) {
+    return (
+      <div className="app-shell state-screen">
+        <span className="spinner" aria-hidden="true" />
+        <p>Loading traffic dataset…</p>
+      </div>
+    );
   }
 
-  if (error) {
+  if (status.error) {
     return (
-      <div className="app-shell error-state">
+      <div className="app-shell state-screen">
         <h1>Dataset load failed</h1>
-        <p>{error}</p>
-        <p>Expected file: <code>/public/data/cybersecurity.csv</code></p>
+        <p>{status.error}</p>
+        <p className="muted">
+          Expected file: <code>public/data/cybersecurity.csv</code>, or load one manually:
+        </p>
+        <input type="file" accept=".csv,text/csv" onChange={handleUpload} />
+        {status.notice && <p className="muted">{status.notice}</p>}
       </div>
     );
   }
 
-  if (!metrics) {
-    return <div className="app-shell loading-state">No data available.</div>;
-  }
+  const filterCount = activeFilterCount(filters);
+  const filterSummary = describeFilters(filters);
 
-  const handleMetricClick = (metricType, value) => {
-    setSelectedMetric({ type: metricType, value });
-  };
-
-  const getFilteredRows = () => {
-    if (!selectedMetric) return [];
-    const { type, value } = selectedMetric;
-    
-    switch (type) {
-      case 'attacks':
-        return rows.filter(row => row.label === 1).slice(0, 20);
-      case 'benign':
-        return rows.filter(row => row.label === 0).slice(0, 20);
-      case 'internal':
-        return rows.filter(row => row.is_internal_traffic).slice(0, 20);
-      case 'attackType':
-        return rows.filter(row => row.attack_type === value).slice(0, 20);
-      default:
-        return [];
-    }
-  };
-
-  const getDetailTitle = () => {
-    if (!selectedMetric) return '';
-    const { type, value } = selectedMetric;
-    
-    switch (type) {
-      case 'attacks':
-        return 'All Attack Events';
-      case 'benign':
-        return 'All Benign Events';
-      case 'internal':
-        return 'Internal Traffic';
-      case 'attackType':
-        return `${value} Attacks`;
-      default:
-        return 'Details';
-    }
-  };
-
-  const DetailModal = () => {
-    const filteredRows = getFilteredRows();
-    
-    return (
-      <div className="modal-overlay" onClick={() => setSelectedMetric(null)}>
-        <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-          <div className="modal-header">
-            <h2>{getDetailTitle()}</h2>
-            <button className="modal-close" onClick={() => setSelectedMetric(null)}>✕</button>
-          </div>
-          <div className="modal-body">
-            <p className="modal-count">Showing {filteredRows.length} of {getFilteredRows().length} records</p>
-            <div className="modal-table-wrap">
-              <table className="modal-table">
-                <thead>
-                  <tr>
-                    <th>Timestamp</th>
-                    <th>Source IP</th>
-                    <th>Dest IP</th>
-                    <th>Protocol</th>
-                    <th>Attack Type</th>
-                    <th>Bytes</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredRows.map((row, idx) => (
-                    <tr key={idx}>
-                      <td>{row.timestamp}</td>
-                      <td>{row.src_ip}</td>
-                      <td>{row.dst_ip}</td>
-                      <td>{row.protocol}</td>
-                      <td>{row.attack_type}</td>
-                      <td>{formatBytes(row.bytes_sent + row.bytes_received)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  };
+  const kpis = [
+    {
+      key: 'events',
+      label: 'Events in view',
+      value: formatNumber(metrics.total),
+      note: `${formatDay(metrics.span.first)} – ${formatDay(metrics.span.last)} · ${metrics.span.days} days`,
+      onClick: () => {
+        setFilters(EMPTY_FILTERS);
+      },
+      action: 'Clear filters',
+    },
+    {
+      key: 'attacks',
+      label: 'Attack events',
+      value: formatNumber(metrics.attacks),
+      note: `${formatPercent(metrics.attackRate)} of traffic is malicious`,
+      onClick: () => {
+        toggleFilter('attackType', 'attacks');
+        focusExplorer();
+      },
+      active: filters.attackType === 'attacks',
+      action: 'Show attacks only',
+      tone: 'alert',
+    },
+    {
+      key: 'internal',
+      label: 'Internal traffic',
+      value: formatNumber(metrics.internal),
+      note: `${formatPercent(metrics.internalRate)} of events`,
+      onClick: () => {
+        toggleFilter('scope', 'internal');
+        focusExplorer();
+      },
+      active: filters.scope === 'internal',
+      action: 'Show internal only',
+    },
+    {
+      key: 'automated',
+      label: 'Automated clients',
+      value: formatNumber(metrics.automated),
+      note: `${formatPercent(metrics.automatedAttackRate)} of them malicious`,
+      action: 'curl, scripts and scanners',
+    },
+    {
+      key: 'volume',
+      label: 'Data volume',
+      value: formatBytes(metrics.totalBytes),
+      note: 'Sent + received',
+    },
+  ];
 
   return (
-    <>
-      <main className="app-shell">
-      <section className="hero panel">
+    <main className="app-shell">
+      <header className="hero panel">
         <div className="hero-copy">
           <div className="hero-meta">
-            <span className="meta-chip live">Live React</span>
-            <span className="meta-chip">CSV-driven</span>
-            <span className="meta-chip">10,000 events</span>
+            <span className="meta-chip live">{source}</span>
+            <span className="meta-chip">{formatNumber(allRows.length)} events</span>
+            <span className="meta-chip">
+              {formatDay(fullSpan.first)} – {formatDay(fullSpan.last)}
+            </span>
           </div>
           <p className="eyebrow">Cyber Risk Quantification</p>
-          <h1>See attack pressure from real traffic data.</h1>
+          <h1>Attack pressure, priced in dollars.</h1>
           <p className="lede">
-            This React dashboard reads <strong>cybersecurity.csv</strong> and turns it into executive-ready
-            metrics, attack patterns, and suspicious samples.
+            Network events from <strong>{source}</strong> turned into a transparent risk score, an annualized loss
+            estimate you can tune, and drill-downs to the rows behind every number.
           </p>
+          <div className="hero-actions">
+            <button type="button" className="primary-button" onClick={() => fileInput.current?.click()}>
+              Load another CSV
+            </button>
+            <input ref={fileInput} type="file" accept=".csv,text/csv" hidden onChange={handleUpload} />
+            {status.notice && <span className="muted small">{status.notice}</span>}
+          </div>
         </div>
 
-        <div className="hero-stats">
-          <article className="stat-card accent">
-            <span className="stat-label">Threat pressure index</span>
-            <strong>{metrics.threatPressure}</strong>
-            <small>{metrics.attackRate * 100 >= 5 ? 'Elevated' : 'Contained'} attack concentration</small>
-          </article>
-          <article className="stat-card">
-            <span className="stat-label">Primary attack type</span>
-            <strong>{metrics.topAttack}</strong>
-            <small>{formatNumber(metrics.topAttackCount)} attack events</small>
-          </article>
+        <div className="score-card">
+          <div className="score-top">
+            <div>
+              <span className="stat-label">Composite risk score</span>
+              <p className="muted small">{filterCount ? `For: ${filterSummary}` : 'All traffic'}</p>
+            </div>
+            <ScoreGauge score={metrics.riskScore} band={metrics.band} />
+          </div>
+          <ul className="score-breakdown">
+            {metrics.components.map((component) => (
+              <li key={component.key} title={component.detail}>
+                <span className="breakdown-label">
+                  <span>{component.label}</span>
+                  <span className="mono">
+                    {component.points.toFixed(0)}/{component.weight}
+                  </span>
+                </span>
+                <span className="breakdown-track" aria-hidden="true">
+                  <span className="breakdown-fill" style={{ width: `${component.value * 100}%` }} />
+                </span>
+                <span className="muted small">{component.detail}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="score-ale">
+            <span className="stat-label">Residual annual loss exposure</span>
+            <strong>{formatUsdCompact(metrics.residualAle)}</strong>
+            <span className="muted small">
+              of {formatUsdCompact(metrics.inherentAle)} inherent at {Math.round(assumptions.controlEffectiveness * 100)}% control
+              effectiveness
+            </span>
+          </div>
         </div>
-      </section>
+      </header>
 
-      <section className="grid stats-grid">
-        <article className="metric-card panel" onClick={() => handleMetricClick('total')} style={{ cursor: 'pointer' }}>
-          <span className="stat-label">Total events</span>
-          <strong>{formatNumber(metrics.totalEvents)}</strong>
-          <small>{formatPercent(metrics.attackRate * 100)} malicious traffic</small>
-        </article>
-        <article className="metric-card panel" onClick={() => handleMetricClick('attacks')} style={{ cursor: 'pointer' }}>
-          <span className="stat-label">Attack events</span>
-          <strong>{formatNumber(metrics.attackEvents)}</strong>
-          <small>{formatNumber(metrics.benignEvents)} benign records</small>
-        </article>
-        <article className="metric-card panel" onClick={() => handleMetricClick('internal')} style={{ cursor: 'pointer' }}>
-          <span className="stat-label">Internal traffic</span>
-          <strong>{formatNumber(metrics.internalTraffic)}</strong>
-          <small>{formatPercent(metrics.internalRate * 100)} of all rows</small>
-        </article>
-        <article className="metric-card panel" onClick={() => handleMetricClick('benign')} style={{ cursor: 'pointer' }}>
-          <span className="stat-label">Data volume</span>
-          <strong>{formatBytes(metrics.totalBytesSent + metrics.totalBytesReceived)}</strong>
-          <small>Sent + received bytes</small>
-        </article>
-      </section>
-
-      <section className="grid content-grid">
-        <article className="panel section-card">
-          <div className="panel-head">
-            <h2>Attack Mix</h2>
-            <span className="muted">Top attack types from CSV</span>
-          </div>
-          <div className="bar-list">
-            {attackBars.map((bar) => (
-              <div key={bar.name} className="bar-row" onClick={() => handleMetricClick('attackType', bar.name)} style={{ cursor: 'pointer' }}>
-                <div className="bar-labels">
-                  <span>{bar.name}</span>
-                  <span>{formatNumber(bar.count)}</span>
-                </div>
-                <div className="bar-track">
-                  <span className="bar-fill attack" style={{ width: `${bar.width}%` }} />
-                </div>
-              </div>
+      <section className="panel filter-bar" aria-label="Filters">
+        <label>
+          <span>From</span>
+          <input
+            type="date"
+            value={filters.from}
+            min={fullSpan.first}
+            max={filters.to || fullSpan.last}
+            onChange={(e) => setFilter('from', e.target.value)}
+          />
+        </label>
+        <label>
+          <span>To</span>
+          <input
+            type="date"
+            value={filters.to}
+            min={filters.from || fullSpan.first}
+            max={fullSpan.last}
+            onChange={(e) => setFilter('to', e.target.value)}
+          />
+        </label>
+        <label>
+          <span>Traffic</span>
+          <select value={filters.scope} onChange={(e) => setFilter('scope', e.target.value)}>
+            <option value="all">All</option>
+            <option value="internal">Internal</option>
+            <option value="external">External</option>
+          </select>
+        </label>
+        <label>
+          <span>Classification</span>
+          <select value={filters.attackType} onChange={(e) => setFilter('attackType', e.target.value)}>
+            <option value="all">All events</option>
+            <option value="attacks">Attacks only</option>
+            <option value="benign">Benign only</option>
+            {options.attackTypes.map((type) => (
+              <option key={type} value={type}>
+                {profileFor(type).label}
+              </option>
             ))}
-          </div>
-        </article>
-
-        <article className="panel section-card">
-          <div className="panel-head">
-            <h2>Protocol Profile</h2>
-            <span className="muted">Traffic by transport</span>
-          </div>
-          <div className="bar-list">
-            {protocolBars.map((bar) => (
-              <div key={bar.name} className="bar-row">
-                <div className="bar-labels">
-                  <span>{bar.name}</span>
-                  <span>{formatNumber(bar.count)}</span>
-                </div>
-                <div className="bar-track">
-                  <span className="bar-fill protocol" style={{ width: `${bar.width}%` }} />
-                </div>
-              </div>
+          </select>
+        </label>
+        <label>
+          <span>Protocol</span>
+          <select value={filters.protocol} onChange={(e) => setFilter('protocol', e.target.value)}>
+            <option value="all">All</option>
+            {options.protocols.map((protocol) => (
+              <option key={protocol}>{protocol}</option>
             ))}
+          </select>
+        </label>
+        <label>
+          <span>Port</span>
+          <select value={filters.port} onChange={(e) => setFilter('port', e.target.value)}>
+            <option value="all">All</option>
+            {options.ports.map((port) => (
+              <option key={port} value={String(port)}>
+                {serviceName(port)}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Client</span>
+          <select value={filters.agent} onChange={(e) => setFilter('agent', e.target.value)}>
+            <option value="all">All</option>
+            {options.agents.map((agent) => (
+              <option key={agent}>{agent}</option>
+            ))}
+          </select>
+        </label>
+        <label className="search">
+          <span>Search IP / URL / user agent</span>
+          <input
+            type="search"
+            placeholder="e.g. 10.0. or phpmyadmin"
+            value={filters.search}
+            onChange={(e) => setFilter('search', e.target.value)}
+          />
+        </label>
+        <button type="button" className="ghost-button" onClick={() => setFilters(EMPTY_FILTERS)} disabled={!filterCount}>
+          Reset{filterCount ? ` (${filterCount})` : ''}
+        </button>
+      </section>
+
+      <section className="stats-grid" aria-label="Key metrics">
+        {kpis.map((kpi) => {
+          const body = (
+            <>
+              <span className="stat-label">{kpi.label}</span>
+              <strong>{kpi.value}</strong>
+              <small>{kpi.note}</small>
+              {kpi.action && <span className="kpi-action">{kpi.action}</span>}
+            </>
+          );
+          return kpi.onClick ? (
+            <button
+              key={kpi.key}
+              type="button"
+              className={`metric-card panel interactive${kpi.active ? ' selected' : ''}${kpi.tone ? ` tone-${kpi.tone}` : ''}`}
+              onClick={kpi.onClick}
+              aria-pressed={kpi.active ?? undefined}
+            >
+              {body}
+            </button>
+          ) : (
+            <div key={kpi.key} className="metric-card panel">
+              {body}
+            </div>
+          );
+        })}
+      </section>
+
+      <section className="grid two-col">
+        <RiskQuantification
+          metrics={metrics}
+          assumptions={assumptions}
+          onLossChange={(type, value) =>
+            setAssumptions((current) => ({ ...current, lossPerEvent: { ...current.lossPerEvent, [type]: value } }))
+          }
+          onControlChange={(value) => setAssumptions((current) => ({ ...current, controlEffectiveness: value }))}
+          onReset={() => setAssumptions(DEFAULT_ASSUMPTIONS)}
+        />
+
+        <article className="panel section-card findings-panel" aria-labelledby="findings-title">
+          <div className="panel-head">
+            <h2 id="findings-title">Key Findings</h2>
+            <span className="muted small">Computed from the current view</span>
+          </div>
+          {findings.length === 0 ? (
+            <p className="empty">No attacks in the current view.</p>
+          ) : (
+            <ol className="findings">
+              {findings.map((finding) => (
+                <li key={finding.title} className={`finding tone-${finding.tone}`}>
+                  <strong>{finding.title}</strong>
+                  <p>{finding.body}</p>
+                </li>
+              ))}
+            </ol>
+          )}
+        </article>
+      </section>
+
+      <section className="grid two-col">
+        <article className="panel section-card" aria-labelledby="trend-title">
+          <div className="panel-head">
+            <h2 id="trend-title">Attack Trend</h2>
+            <span className="muted small">Weekly</span>
+          </div>
+          <TrendChart trend={metrics.trend} span={metrics.span} />
+        </article>
+
+        <article className="panel section-card" aria-labelledby="mix-title">
+          <div className="panel-head">
+            <h2 id="mix-title">Attack Mix</h2>
+            <span className="muted small">Click to filter</span>
+          </div>
+          {metrics.attackTypes.length === 0 ? (
+            <p className="empty">No attacks in the current view.</p>
+          ) : (
+            <BarList
+              items={metrics.attackTypes.map((item) => ({ key: item.type, label: item.label, value: item.count, item }))}
+              selectedKey={filters.attackType}
+              onSelect={(type) => toggleFilter('attackType', type)}
+              renderMeta={({ item }) => `S${item.severity}`}
+            />
+          )}
+          <div className="sub-section">
+            <h3>Attacks by hour (UTC)</h3>
+            <HourStrip hours={metrics.hours} />
           </div>
         </article>
       </section>
 
-      <section className="grid bottom-grid">
-        <article className="panel section-card">
+      <section className="grid wide-left">
+        <article className="panel section-card" aria-labelledby="heat-title">
           <div className="panel-head">
-            <h2>Attack Trend</h2>
-            <span className="muted">By day</span>
+            <h2 id="heat-title">Targeted Services</h2>
+            <span className="muted small">Attack type × destination port · click a cell to drill in</span>
           </div>
-          <div className="trend-chart">
-            {metrics.trend.map((point) => {
-              const attackHeight = Math.max(10, (point.attacks / Math.max(...metrics.trend.map((entry) => entry.attacks), 1)) * 100);
-              const totalHeight = Math.max(12, (point.total / Math.max(...metrics.trend.map((entry) => entry.total), 1)) * 100);
-              return (
-                <div key={point.day} className="trend-column">
-                  <div className="trend-bars">
-                    <span className="trend-total" style={{ height: `${totalHeight}%` }} />
-                    <span className="trend-attack" style={{ height: `${attackHeight}%` }} />
-                  </div>
-                  <span className="trend-label">{point.day.slice(5)}</span>
-                </div>
-              );
-            })}
-          </div>
+          <Heatmap
+            heatmap={metrics.heatmap}
+            labelForType={(type) => profileFor(type).label}
+            labelForPort={serviceName}
+            onSelect={(type, port) => {
+              setFilters((current) => ({ ...current, attackType: type, port: String(port) }));
+              focusExplorer();
+            }}
+          />
         </article>
 
-        <article className="panel section-card ai-panel">
+        <article className="panel section-card" aria-labelledby="clients-title">
           <div className="panel-head">
-            <h2>Analyst Summary</h2>
-            <span className="pill">React AI style</span>
+            <h2 id="clients-title">Clients &amp; Protocols</h2>
+            <span className="muted small">Attack rate per group</span>
           </div>
-          <p className="ai-lede">
-            The dataset is dominated by benign traffic, but the attack mix is concentrated in {metrics.topAttack}.
-            {metrics.topAttack === 'port-scan' ? ' That usually means recon activity is the clearest early-warning signal.' : ' Focus on the highest-frequency attack family and the ports it touches.'}
-          </p>
-          <div className="ai-result-grid">
-            <div className="ai-result-card">
-              <span className="ai-label">Primary risk</span>
-              <strong>{metrics.topAttack}</strong>
-            </div>
-            <div className="ai-result-card">
-              <span className="ai-label">Recommendation</span>
-              <strong>Tighten monitoring on {metrics.topAttack === 'port-scan' ? 'scan-heavy destinations' : 'attack-heavy ports'}.</strong>
-            </div>
-          </div>
-          <div className="ai-steps">
-            <div className="ai-step">
-              <span className="ai-step-number">1</span>
-              <p>Prioritize detections around {metrics.topAttack} because it is the most frequent attack label in the CSV.</p>
-            </div>
-            <div className="ai-step">
-              <span className="ai-step-number">2</span>
-              <p>Validate protocol baselines, especially {metrics.protocols[0]?.[0] || 'TCP'}, which carries most of the traffic volume.</p>
-            </div>
-            <div className="ai-step">
-              <span className="ai-step-number">3</span>
-              <p>Use the suspicious samples list to show concrete examples of malicious rows during the presentation.</p>
-            </div>
+          <BarList
+            tone="protocol"
+            items={metrics.agents.map((agent) => ({ key: agent.key, label: agent.key, value: agent.total, agent }))}
+            selectedKey={filters.agent}
+            onSelect={(agent) => toggleFilter('agent', agent)}
+            renderMeta={({ agent }) => formatPercent(agent.rate)}
+          />
+          <div className="sub-section">
+            <BarList
+              tone="protocol"
+              items={metrics.protocols.map((p) => ({ key: p.key, label: p.key, value: p.total, p }))}
+              selectedKey={filters.protocol}
+              onSelect={(protocol) => toggleFilter('protocol', protocol)}
+              renderMeta={({ p }) => formatPercent(p.rate)}
+            />
           </div>
         </article>
       </section>
 
-      <section className="grid table-grid">
-        <article className="panel section-card full-width">
-          <div className="panel-head">
-            <h2>Suspicious Samples</h2>
-            <span className="muted">Top attack rows by traffic volume</span>
-          </div>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Timestamp</th>
-                  <th>Source</th>
-                  <th>Destination</th>
-                  <th>Protocol</th>
-                  <th>Attack</th>
-                  <th>Bytes</th>
-                  <th>URL</th>
-                </tr>
-              </thead>
-              <tbody>
-                {metrics.suspiciousTraffic.map((row, index) => (
-                  <tr key={`${row.timestamp}-${index}`}>
-                    <td>{row.timestamp}</td>
-                    <td>{row.src_ip}</td>
-                    <td>{row.dst_ip}</td>
-                    <td>{row.protocol}</td>
-                    <td>{row.attack_type}</td>
-                    <td>{formatBytes(row.bytes_sent + row.bytes_received)}</td>
-                    <td>{row.url || '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </article>
-      </section>
+      <EventExplorer rows={rows} filterSummary={filterSummary} />
+
+      <footer className="page-footer muted small">
+        Scores and dollar figures are model outputs driven by the assumptions above — use them to compare and
+        prioritize, not as audited loss figures.
+      </footer>
     </main>
-    {selectedMetric && <DetailModal />}
-    </>
   );
 }
 
-export default App;
+// Keep the port dropdown readable: well-known services plus any port with real volume.
+function commonPorts(rows) {
+  const counts = new Map();
+  for (const row of rows) counts.set(row.dst_port, (counts.get(row.dst_port) || 0) + 1);
+  return [...counts.entries()]
+    .filter(([port, count]) => count >= 20 || serviceName(port) !== String(port))
+    .map(([port]) => port)
+    .sort((a, b) => a - b);
+}
