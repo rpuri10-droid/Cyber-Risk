@@ -115,7 +115,8 @@ export default function RiskQuantification({ metrics, assumptions, onLossChange,
       <p className="footnote">
         Loss-per-attempt values are illustrative starting points (blending the chance an attempt succeeds with the
         cost if it does). Replace them with figures from your own incident history or insurance data. Changes are
-        saved in this browser. Top driver: <strong>{metrics.byAle[0]?.label || '—'}</strong>
+        saved in this browser. The slider above is a single quick estimate; the <a href="#/scenarios">Scenarios</a>{' '}
+        and <a href="#/controls">Controls</a> pages model individual controls with a simulation. Top driver: <strong>{metrics.byAle[0]?.label || '—'}</strong>
         {metrics.byAle[0] ? ` (${formatPercent(metrics.byAle[0].inherentAle / (inherentAle || 1), 0)} of exposure)` : ''}.
       </p>
     </article>

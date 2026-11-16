@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import Papa from 'papaparse';
 import {
   ATTACK_PROFILES,
@@ -19,26 +19,39 @@ import {
 import { BarList, Heatmap, HourStrip, ScoreGauge, TrendChart } from './components/Charts';
 import RiskQuantification from './components/RiskQuantification';
 import EventExplorer from './components/EventExplorer';
+import ScenariosView from './components/ScenariosView';
+import ControlsView from './components/ControlsView';
+import ExecutiveSummary from './components/ExecutiveSummary';
+import { analyzeRisk, buildScenarios, executiveSummary } from './lib/risk';
+import { SEED_CONTROLS } from './lib/seedControls';
+import { DEFAULT_ASSUMPTIONS, loadState, normalizeControl, saveState } from './lib/store';
 
 const DATA_URL = `${import.meta.env.BASE_URL}data/cybersecurity.csv`;
 const REQUIRED_COLUMNS = ['timestamp', 'src_ip', 'dst_ip', 'dst_port', 'protocol', 'label', 'attack_type'];
-const STORAGE_KEY = 'cyber-risk-assumptions-v1';
 
-const DEFAULT_ASSUMPTIONS = {
-  controlEffectiveness: 0.6,
-  lossPerEvent: Object.fromEntries(Object.entries(ATTACK_PROFILES).map(([type, p]) => [type, p.lossPerEvent])),
-};
+const VIEWS = [
+  { key: 'dashboard', label: 'Dashboard' },
+  { key: 'scenarios', label: 'Scenarios' },
+  { key: 'controls', label: 'Controls' },
+  { key: 'summary', label: 'Executive Summary' },
+];
 
-function loadAssumptions() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (saved && typeof saved.controlEffectiveness === 'number') {
-      return { ...DEFAULT_ASSUMPTIONS, ...saved, lossPerEvent: { ...DEFAULT_ASSUMPTIONS.lossPerEvent, ...saved.lossPerEvent } };
-    }
-  } catch {
-    // storage unavailable or corrupt: fall back to defaults
-  }
-  return DEFAULT_ASSUMPTIONS;
+// Minimal hash router: #/scenarios, #/scenarios/<id>, #/controls, #/summary.
+function useHashRoute() {
+  const [hash, setHash] = useState(() => window.location.hash);
+  useEffect(() => {
+    const onChange = () => {
+      setHash(window.location.hash);
+      window.scrollTo(0, 0);
+    };
+    window.addEventListener('hashchange', onChange);
+    return () => window.removeEventListener('hashchange', onChange);
+  }, []);
+  const [view = '', id = ''] = hash.replace(/^#\/?/, '').split('/');
+  return {
+    view: VIEWS.some((item) => item.key === view) ? view : 'dashboard',
+    id: id ? decodeURIComponent(id) : null,
+  };
 }
 
 function parseCsv(input) {
@@ -139,7 +152,18 @@ export default function App() {
   const [source, setSource] = useState('cybersecurity.csv');
   const [status, setStatus] = useState({ loading: true, error: '', notice: '' });
   const [filters, setFilters] = useState(EMPTY_FILTERS);
-  const [assumptions, setAssumptions] = useState(loadAssumptions);
+  // Saved model state: assumptions, scenario ranges, controls, appetite, settings.
+  const [model, setModel] = useState(() => loadState());
+  const assumptions = model.assumptions;
+  const setAssumptions = useCallback(
+    (update) =>
+      setModel((current) => ({
+        ...current,
+        assumptions: typeof update === 'function' ? update(current.assumptions) : update,
+      })),
+    [],
+  );
+  const route = useHashRoute();
   const fileInput = useRef(null);
 
   useEffect(() => {
@@ -164,12 +188,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(assumptions));
-    } catch {
-      // ignore storage failures
-    }
-  }, [assumptions]);
+    saveState(model);
+  }, [model]);
 
   const handleUpload = async (event) => {
     const file = event.target.files?.[0];
@@ -191,6 +211,45 @@ export default function App() {
   const rows = useMemo(() => applyFilters(allRows, filters), [allRows, filters]);
   const metrics = useMemo(() => computeMetrics(rows, assumptions), [rows, assumptions]);
   const findings = useMemo(() => buildFindings(metrics), [metrics]);
+
+  // Scenario / control modelling always uses the whole dataset, not the dashboard filters.
+  // It is skipped on the Dashboard, and deferred so typing in an input stays responsive.
+  const deferredModel = useDeferredValue(model);
+  const needsAnalysis = route.view !== 'dashboard';
+  const analysis = useMemo(() => {
+    if (!needsAnalysis || allRows.length === 0) return null;
+    const { attackTypes } = computeMetrics(allRows, deferredModel.assumptions);
+    return analyzeRisk({
+      scenarios: buildScenarios(attackTypes, deferredModel.scenarioRanges),
+      controls: deferredModel.controls,
+      appetite: deferredModel.appetite,
+      settings: deferredModel.settings,
+    });
+  }, [needsAnalysis, allRows, deferredModel]);
+  const summary = useMemo(() => (analysis && route.view === 'summary' ? executiveSummary(analysis) : null), [analysis, route.view]);
+
+  const patchModel = (patch) => setModel((current) => ({ ...current, ...patch(current) }));
+  const setLoss = (type, value) =>
+    setAssumptions((current) => ({ ...current, lossPerEvent: { ...current.lossPerEvent, [type]: value } }));
+  const saveControl = (draft) =>
+    patchModel((current) => {
+      const control = normalizeControl({ ...draft, id: draft.id || `control-${Date.now().toString(36)}` });
+      const exists = current.controls.some((item) => item.id === control.id);
+      return { controls: exists ? current.controls.map((item) => (item.id === control.id ? control : item)) : [...current.controls, control] };
+    });
+  const toggleControl = (controlId, scenarioId) =>
+    patchModel((current) => ({
+      controls: current.controls.map((control) =>
+        control.id !== controlId
+          ? control
+          : {
+              ...control,
+              scenarioIds: control.scenarioIds.includes(scenarioId)
+                ? control.scenarioIds.filter((id) => id !== scenarioId)
+                : [...control.scenarioIds, scenarioId],
+            },
+      ),
+    }));
 
   const options = useMemo(
     () => ({
@@ -288,6 +347,44 @@ export default function App() {
 
   return (
     <main className="app-shell">
+      <nav className="panel view-nav no-print" aria-label="Pages">
+        <span className="view-nav-title">Cyber Risk Quantification</span>
+        <ul>
+          {VIEWS.map((item) => (
+            <li key={item.key}>
+              <a href={`#/${item.key}`} className={route.view === item.key ? 'active' : undefined} aria-current={route.view === item.key ? 'page' : undefined}>
+                {item.label}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </nav>
+
+      {route.view === 'scenarios' && analysis && (
+        <ScenariosView
+          analysis={analysis}
+          selectedId={route.id}
+          onAppetiteChange={(appetite) => patchModel(() => ({ appetite }))}
+          onRangeChange={(id, range) => patchModel((current) => ({ scenarioRanges: { ...current.scenarioRanges, [id]: range } }))}
+          onLossChange={setLoss}
+          onToggleControl={toggleControl}
+        />
+      )}
+
+      {route.view === 'controls' && analysis && (
+        <ControlsView
+          analysis={analysis}
+          onSave={saveControl}
+          onDelete={(id) => patchModel((current) => ({ controls: current.controls.filter((control) => control.id !== id) }))}
+          onResetControls={() => patchModel(() => ({ controls: SEED_CONTROLS.map(normalizeControl) }))}
+          onAmortizationChange={(years) => patchModel((current) => ({ settings: { ...current.settings, amortizationYears: years } }))}
+        />
+      )}
+
+      {route.view === 'summary' && summary && <ExecutiveSummary summary={summary} source={source} />}
+
+      {route.view === 'dashboard' && (
+        <>
       <header className="hero panel">
         <div className="hero-copy">
           <div className="hero-meta">
@@ -464,9 +561,7 @@ export default function App() {
         <RiskQuantification
           metrics={metrics}
           assumptions={assumptions}
-          onLossChange={(type, value) =>
-            setAssumptions((current) => ({ ...current, lossPerEvent: { ...current.lossPerEvent, [type]: value } }))
-          }
+          onLossChange={setLoss}
           onControlChange={(value) => setAssumptions((current) => ({ ...current, controlEffectiveness: value }))}
           onReset={() => setAssumptions(DEFAULT_ASSUMPTIONS)}
         />
@@ -564,8 +659,10 @@ export default function App() {
       </section>
 
       <EventExplorer rows={rows} filterSummary={filterSummary} />
+        </>
+      )}
 
-      <footer className="page-footer muted small">
+      <footer className="page-footer muted small no-print">
         Scores and dollar figures are model outputs driven by the assumptions above — use them to compare and
         prioritize, not as audited loss figures.
       </footer>

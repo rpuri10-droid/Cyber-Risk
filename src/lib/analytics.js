@@ -350,6 +350,15 @@ const usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD',
 export const formatNumber = (value) => numberFmt.format(Math.round(value));
 export const formatUsd = (value) => usd.format(value);
 export const formatUsdCompact = (value) => compactUsd.format(value);
+// Like formatUsdCompact but without a trailing ".0" ($1M, $2.4M, $80K): used in prose.
+const shortUsd = new Intl.NumberFormat('en-US', {
+  style: 'currency',
+  currency: 'USD',
+  notation: 'compact',
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 1,
+});
+export const formatUsdShort = (value) => shortUsd.format(value);
 export const formatPercent = (value, digits = 1) => `${(value * 100).toFixed(digits)}%`;
 
 export function formatBytes(value) {
